@@ -17,7 +17,12 @@ const app = express();
 
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN?.split(",") ?? "*",
+    origin: [
+      "http://localhost:3000",
+      "http://localhost:5173",
+      "https://volunteermanagementsystem-frontend.vercel.app",
+      ...(process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(",") : [])
+    ],
     credentials: true,
   })
 );
