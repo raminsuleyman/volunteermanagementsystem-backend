@@ -324,4 +324,28 @@ router.put(
   })
 );
 
+// DELETE /api/shifts/:id — mövcud növbəni sil
+router.delete(
+  "/:id",
+  asyncHandler(async (req, res) => {
+    const { data: shift, error } = await supabase
+      .from("shifts")
+      .select("*")
+      .eq("id", req.params.id)
+      .maybeSingle();
+    if (error) throw new ApiError(500, "DB_ERROR", error.message);
+    if (!shift) throw new ApiError(404, "NOT_FOUND", "Növbə tapılmadı");
+
+    // Supabase-də shifts table-dan silirik, ON DELETE CASCADE olduğu üçün 
+    // time_slots, assignments, shift_volunteers, shift_notes avtomatik silinəcək.
+    const { error: delErr } = await supabase
+      .from("shifts")
+      .delete()
+      .eq("id", shift.id);
+    if (delErr) throw new ApiError(500, "DB_ERROR", delErr.message);
+
+    res.json({ success: true, data: { message: "Növbə arxivdən uğurla silindi" } });
+  })
+);
+
 export default router;
