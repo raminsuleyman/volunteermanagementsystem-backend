@@ -29,11 +29,24 @@ const notesSchema = z.object({
 const shiftSchema = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Tarix YYYY-MM-DD formatında olmalıdır"),
   shiftType: z.enum(["seher", "gunorta", "axsam"]),
-  teamLeaderFirstName: z.string().min(1).max(100),
-  teamLeaderLastName: z.string().min(1).max(100),
-  volunteerIds: z.array(z.number().int().positive()).min(1, "Ən azı bir könüllü seçilməlidir"),
-  assignments: z.record(z.string(), z.record(z.string(), z.array(z.number().int().positive()))),
+  status: z.enum(["draft", "completed"]).default("completed"),
+  teamLeaderFirstName: z.string().max(100).default(""),
+  teamLeaderLastName: z.string().max(100).default(""),
+  volunteerIds: z.array(z.number().int().positive()).default([]),
+  assignments: z.record(z.string(), z.record(z.string(), z.array(z.number().int().positive()))).default({}),
   notes: notesSchema.default({}),
+}).superRefine((data, ctx) => {
+  if (data.status === "completed") {
+    if (!data.teamLeaderFirstName || data.teamLeaderFirstName.length < 1) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["teamLeaderFirstName"], message: "TL adı tələb olunur" });
+    }
+    if (!data.teamLeaderLastName || data.teamLeaderLastName.length < 1) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["teamLeaderLastName"], message: "TL soyadı tələb olunur" });
+    }
+    if (!data.volunteerIds || data.volunteerIds.length < 1) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["volunteerIds"], message: "Ən azı bir könüllü seçilməlidir" });
+    }
+  }
 });
 
 const notesToDb = (n) => ({
@@ -108,11 +121,13 @@ async function writeShiftChildren(shiftId, body) {
   // slot-index -> db id xəritəsi
   const slotIdByIndex = Object.fromEntries(dbSlots.map((s) => [s.slot_index, s.id]));
 
-  // shift_volunteers
-  const { error: svErr } = await supabase.from("shift_volunteers").insert(
-    body.volunteerIds.map((vid) => ({ shift_id: shiftId, volunteer_id: vid }))
-  );
-  if (svErr) throw new ApiError(500, "DB_ERROR", svErr.message);
+  // shift_volunteers (draft-da boş ola bilər)
+  if (body.volunteerIds.length > 0) {
+    const { error: svErr } = await supabase.from("shift_volunteers").insert(
+      body.volunteerIds.map((vid) => ({ shift_id: shiftId, volunteer_id: vid }))
+    );
+    if (svErr) throw new ApiError(500, "DB_ERROR", svErr.message);
+  }
 
   // assignments: "slot-N" açarından slot_index çıxarılır
   const rows = [];
@@ -185,6 +200,7 @@ async function loadShiftDetail(shiftId) {
     })),
     assignments,
     notes: notesToApi(notes),
+    status: shift.status ?? "completed",
     savedAt: shift.saved_at,
   };
 }
@@ -204,6 +220,7 @@ router.get(
 
     if (req.query.date) query = query.eq("date", req.query.date);
     if (req.query.shiftType) query = query.eq("shift_type", req.query.shiftType);
+    if (req.query.status) query = query.eq("status", req.query.status);
 
     const { data, error, count } = await query;
     if (error) throw new ApiError(500, "DB_ERROR", error.message);
@@ -217,6 +234,7 @@ router.get(
         teamLeaderFirstName: s.tl_first_name,
         teamLeaderLastName: s.tl_last_name,
         volunteerCount: (s.shift_volunteers ?? []).length,
+        status: s.status ?? "completed",
         savedAt: s.saved_at,
       })),
       meta: { page, limit, total: count ?? 0 },
@@ -239,21 +257,61 @@ router.post(
   validate(shiftSchema),
   asyncHandler(async (req, res) => {
     const body = req.body;
-    validateAssignments(body.assignments, body.volunteerIds);
 
-    // Konflikt yoxlaması: eyni gün + tip (409)
-    const { data: existing } = await supabase
-      .from("shifts")
-      .select("id")
-      .eq("date", body.date)
-      .eq("shift_type", body.shiftType)
-      .maybeSingle();
-    if (existing) {
-      throw new ApiError(
-        409,
-        "CONFLICT",
-        `${body.date} tarixində ${SHIFT_TYPES[body.shiftType].label} növbəsi artıq mövcuddur (id: ${existing.id})`
-      );
+    // Assignments validasiyası yalnız completed üçün
+    if (body.status === "completed") {
+      validateAssignments(body.assignments, body.volunteerIds);
+    }
+
+    // Konflikt yoxlaması: eyni gün + tip + completed (409)
+    if (body.status === "completed") {
+      const { data: existingCompleted } = await supabase
+        .from("shifts")
+        .select("id")
+        .eq("date", body.date)
+        .eq("shift_type", body.shiftType)
+        .eq("status", "completed")
+        .maybeSingle();
+      if (existingCompleted) {
+        throw new ApiError(
+          409,
+          "CONFLICT",
+          `${body.date} tarixində ${SHIFT_TYPES[body.shiftType].label} növbəsi artıq mövcuddur (id: ${existingCompleted.id})`
+        );
+      }
+    }
+
+    // Draft upsert: eyni gün+tip+draft varsa, mövcud draft-ı yenilə
+    if (body.status === "draft") {
+      const { data: existingDraft } = await supabase
+        .from("shifts")
+        .select("id")
+        .eq("date", body.date)
+        .eq("shift_type", body.shiftType)
+        .eq("status", "draft")
+        .maybeSingle();
+
+      if (existingDraft) {
+        // Mövcud draft-ın alt-obyektlərini sil, yenidən yaz
+        await supabase.from("time_slots").delete().eq("shift_id", existingDraft.id);
+        await supabase.from("shift_volunteers").delete().eq("shift_id", existingDraft.id);
+        await supabase.from("shift_notes").delete().eq("shift_id", existingDraft.id);
+
+        await supabase
+          .from("shifts")
+          .update({
+            tl_first_name: body.teamLeaderFirstName,
+            tl_last_name: body.teamLeaderLastName,
+            team_leader_id: Number(req.user.id) || null,
+            saved_at: new Date().toISOString(),
+          })
+          .eq("id", existingDraft.id);
+
+        await writeShiftChildren(existingDraft.id, body);
+
+        const detail = await loadShiftDetail(existingDraft.id);
+        return res.json({ success: true, data: detail });
+      }
     }
 
     const { data: shift, error } = await supabase
@@ -264,6 +322,7 @@ router.post(
         team_leader_id: Number(req.user.id) || null,
         tl_first_name: body.teamLeaderFirstName,
         tl_last_name: body.teamLeaderLastName,
+        status: body.status,
       })
       .select()
       .single();
@@ -288,7 +347,11 @@ router.put(
   validate(shiftSchema),
   asyncHandler(async (req, res) => {
     const body = req.body;
-    validateAssignments(body.assignments, body.volunteerIds);
+
+    // Assignments validasiyası yalnız completed üçün
+    if (body.status === "completed") {
+      validateAssignments(body.assignments, body.volunteerIds);
+    }
 
     const { data: shift, error } = await supabase
       .from("shifts")
@@ -298,10 +361,30 @@ router.put(
     if (error) throw new ApiError(500, "DB_ERROR", error.message);
     if (!shift) throw new ApiError(404, "NOT_FOUND", "Növbə tapılmadı");
 
-    // Tövsiyə: saxlanmadan 24 saat sonra redaktə bağlanır
-    const ageHours = (Date.now() - new Date(shift.saved_at).getTime()) / 3600000;
-    if (ageHours > 24) {
-      throw new ApiError(422, "VALIDATION_ERROR", "Arxivlənmiş növbə 24 saatdan sonra redaktə oluna bilməz");
+    // 24 saatlıq redaktə limiti YALNIZ completed növbələr üçün
+    if (shift.status === "completed") {
+      const ageHours = (Date.now() - new Date(shift.saved_at).getTime()) / 3600000;
+      if (ageHours > 24) {
+        throw new ApiError(422, "VALIDATION_ERROR", "Arxivlənmiş növbə 24 saatdan sonra redaktə oluna bilməz");
+      }
+    }
+
+    // Draft → completed keçidində: eyni gün+tip üçün artıq completed varsa 409
+    if (shift.status === "draft" && body.status === "completed") {
+      const { data: existingCompleted } = await supabase
+        .from("shifts")
+        .select("id")
+        .eq("date", shift.date)
+        .eq("shift_type", shift.shift_type)
+        .eq("status", "completed")
+        .maybeSingle();
+      if (existingCompleted) {
+        throw new ApiError(
+          409,
+          "CONFLICT",
+          `${shift.date} tarixində ${SHIFT_TYPES[shift.shift_type].label} növbəsi artıq mövcuddur (id: ${existingCompleted.id})`
+        );
+      }
     }
 
     // köhnə alt-obyektləri sil, yenidən yaz
@@ -314,6 +397,7 @@ router.put(
       .update({
         tl_first_name: body.teamLeaderFirstName,
         tl_last_name: body.teamLeaderLastName,
+        status: body.status,
       })
       .eq("id", shift.id);
 
